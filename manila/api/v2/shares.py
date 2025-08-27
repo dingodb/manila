@@ -198,13 +198,13 @@ class ShareController(wsgi.Controller,
     def create(self, req, body):
         if not self.is_valid_body(body, 'share'):
             raise exc.HTTPUnprocessableEntity()
-
+        project_id = body.get('share', {}).get('project_id')
         share = body['share']
         scheduler_hints = share.pop('scheduler_hints', None)
         if req.api_version_request < api_version.APIVersionRequest("2.67"):
             if scheduler_hints:
                 scheduler_hints.pop('only_host', None)
-        return self._create(req, body,
+        return self._create(req, body, project_id=project_id,
                             check_create_share_from_snapshot_support=True,
                             check_availability_zones_extra_spec=True,
                             scheduler_hints=scheduler_hints)

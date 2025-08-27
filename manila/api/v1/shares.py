@@ -252,7 +252,7 @@ class ShareMixin(object):
         return share
 
     @wsgi.Controller.authorize('create')
-    def _create(self, req, body,
+    def _create(self, req, body, project_id=None,
                 check_create_share_from_snapshot_support=False,
                 check_availability_zones_extra_spec=False,
                 scheduler_hints=None):
@@ -442,7 +442,8 @@ class ShareMixin(object):
             kwargs['share_type'] = share_type
         if share_network_id:
             kwargs['share_network_id'] = share_network_id
-
+        if project_id:
+            context.project_id = project_id
         kwargs['scheduler_hints'] = scheduler_hints
 
         new_share = self.share_api.create(context,

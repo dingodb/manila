@@ -36,6 +36,7 @@ from manila.lock import api as resource_locks
 from manila import share
 from manila.share import share_types
 from manila import utils
+from manila.common.client_auth import connect_keystone_with_token
 
 LOG = log.getLogger(__name__)
 
@@ -443,7 +444,11 @@ class ShareMixin(object):
         if share_network_id:
             kwargs['share_network_id'] = share_network_id
         if project_id:
-            context.project_id = project_id
+            if self._check_project_id(context, project_id):
+                context.project_id = project_id
+            else:
+                raise exc.HTTPNotFound(explanation=_("Project not found"))
+
         kwargs['scheduler_hints'] = scheduler_hints
 
         new_share = self.share_api.create(context,
@@ -454,6 +459,21 @@ class ShareMixin(object):
                                           **kwargs)
 
         return self._view_builder.detail(req, new_share)
+
+    def _check_project_id(self, context, project_id) -> bool:
+        if project_id and project_id != context.project_id:
+            keystone = connect_keystone_with_token(context_token=context.auth_token)
+            try:
+                project =  keystone.projects.list()
+                if project:
+                    return True
+                else:
+                    return False
+            except Exception as e:
+                LOG.error(e)
+                return False
+        else:
+            return True
 
     @staticmethod
     def _any_instance_has_errored_rules(share):

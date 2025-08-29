@@ -17,7 +17,8 @@ import copy
 
 from keystoneauth1 import loading as ks_loading
 from oslo_config import cfg
-
+from keystoneauth1 import loading,session
+from keystoneclient.v3 import client
 from manila import exception
 from manila.i18n import _
 
@@ -32,6 +33,38 @@ needed to load all needed parameters dynamically.
 
 """
 
+
+def connect_keystone_with_token(context_token):
+
+    auth_url = CONF["keystone_authtoken"].auth_url
+
+    # loader = loading.get_plugin_loader('token')
+    # auth = loader.load_from_options(
+    #     token=context_token,
+    #     auth_url=auth_url
+    # )
+
+    username = CONF["keystone_authtoken"].username
+    password = CONF["keystone_authtoken"].password
+    project_name =CONF["keystone_authtoken"].project_name
+    user_domain_name = CONF["keystone_authtoken"].project_domain_id  # 关键：指定admin用户所在的域
+    project_domain_name =  CONF["keystone_authtoken"].project_domain_id  # 关键：指定admin项目所在的域
+
+    # 2. & 3. 创建认证加载器和会话
+    loader = loading.get_plugin_loader('password')
+    auth = loader.load_from_options(
+        auth_url=auth_url,
+        username=username,
+        password=password,
+        project_name=project_name,
+        user_domain_name=user_domain_name,
+        project_domain_name=project_domain_name
+    )
+
+    sess = session.Session(auth=auth)
+
+    keystone = client.Client(session=sess)
+    return keystone
 
 class AuthClientLoader(object):
     def __init__(self, client_class, cfg_group):

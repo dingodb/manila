@@ -583,6 +583,7 @@ class GaneshaManager(object):
             with rados.WriteOpCtx() as wop:
                 wop.write_full(encoded_data)
                 ioctx.operate_write_op(wop, object_name)
+            ioctx.notify(object_name, '')
         except rados.OSError as e:
             LOG.error(e)
             raise e
@@ -594,6 +595,7 @@ class GaneshaManager(object):
         ioctx = self.rados_client.open_ioctx(pool_name)
         try:
             ioctx.remove_object(object_name)
+            ioctx.notify(object_name, '')
         except rados.ObjectNotFound:
             LOG.warning("Object '{0}' was already removed".format(object_name))
         finally:

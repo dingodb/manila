@@ -157,7 +157,7 @@ class GPFSShareDriver(driver.ExecuteMixin, driver.GaneshaMixin,
         host = self.configuration.gpfs_share_export_ip
         check_exit_code = kwargs.pop('check_exit_code', True)
         ignore_exit_code = kwargs.pop('ignore_exit_code', None)
-
+        LOG.debug('Running remote GPFS command on host %s and cmd %s', host, cmd)
         return self._run_ssh(host, cmd, ignore_exit_code, check_exit_code)
 
     def _sanitize_command(self, cmd_list):
@@ -209,11 +209,32 @@ class GPFSShareDriver(driver.ExecuteMixin, driver.GaneshaMixin,
         channel = stdout_stream.channel
 
         stdout = stdout_stream.read()
-        sanitized_stdout = strutils.mask_password(stdout)
         stderr = stderr_stream.read()
-        sanitized_stderr = strutils.mask_password(stderr)
-
         stdin_stream.close()
+
+        def _to_text(val):
+            # Normalize bytes/str/stringified-bytes and escaped newlines
+            if isinstance(val, bytes):
+                val = val.decode('utf-8', 'ignore')
+            else:
+                val = str(val)
+                if val.startswith("b'") or val.startswith('b"'):
+                    try:
+                        import ast
+                        val_eval = ast.literal_eval(val)
+                        if isinstance(val_eval, bytes):
+                            val = val_eval.decode('utf-8', 'ignore')
+                        else:
+                            val = str(val_eval)
+                    except Exception:
+                        val = val[2:-1]
+            return val.replace('\\n', '\n')
+
+        stdout = _to_text(stdout)
+        stderr = _to_text(stderr)
+
+        sanitized_stdout = strutils.mask_password(stdout)
+        sanitized_stderr = strutils.mask_password(stderr)
 
         exit_status = channel.recv_exit_status()
 
@@ -242,6 +263,7 @@ class GPFSShareDriver(driver.ExecuteMixin, driver.GaneshaMixin,
         lines = out.splitlines()
         try:
             state_token = lines[0].split(':').index('state')
+            LOG.debug('GPFS state is %s.  GPS_PATH %s', lines, self.GPFS_PATH)
             gpfs_state = lines[1].split(':')[state_token]
         except (IndexError, ValueError) as e:
             msg = (_('Failed to check GPFS state. Error: %(excmsg)s.') %
@@ -256,6 +278,7 @@ class GPFSShareDriver(driver.ExecuteMixin, driver.GaneshaMixin,
         try:
             output, __ = self._gpfs_execute('stat', '--format=%F', path,
                                             run_as_root=False)
+            LOG.debug('is_dir output is %s.  ', output)
         except exception.ProcessExecutionError as e:
             msg = (_('%(path)s is not a directory. Error: %(excmsg)s') %
                    {'path': path, 'excmsg': e})

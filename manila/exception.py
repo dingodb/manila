@@ -1215,3 +1215,7 @@ class VastShareNotFound(ShareBackendException):
 
 class VastDriverException(ShareBackendException):
     message = _("Vast driver error: %(reason)s.")
+
+
+class DingoFSException(ManilaException):
+    message = _("DingoFS exception occurred: %(msg)s")

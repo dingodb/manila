@@ -1186,3 +1186,6 @@ class ShareBackupSizeExceedsAvailableQuota(QuotaError):
 class NetappActiveIQWeigherRequiredParameter(ManilaException):
     message = _("%(config)s configuration of the NetAppActiveIQ weigher "
                 "must be set.")
+
+class DingoFSException(ManilaException):
+    message = _("DingoFS exception occurred: %(msg)s")

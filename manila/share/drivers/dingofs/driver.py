@@ -248,7 +248,7 @@ class DingoFSShareDriver(driver.ExecuteMixin, driver.GaneshaMixin,
         # Convert size to string (unit is GB)
         sizestr = str(shareobj['size'])
         try:
-            out, __ = self._dingo_execute(self.DINGO_TOOL_PATH, 'create', 'subpath', '--fsname', self.fs_name,
+            out, __ = self._dingo_execute(self.DINGO_TOOL_PATH, 'fs', 'subpath', 'create', '--fsname', self.fs_name,
                                           '--path', '/%s' % sharename)
             self._check_dingo_result(out, 'Create subpath', sharename)
         except exception.ProcessExecutionError as e:
@@ -266,7 +266,7 @@ class DingoFSShareDriver(driver.ExecuteMixin, driver.GaneshaMixin,
                 raise exception.DingoFSException(msg)
 
         try:
-            out, __ = self._dingo_execute(self.DINGO_TOOL_PATH, 'quota', 'set', '--fsname', self.fs_name,
+            out, __ = self._dingo_execute(self.DINGO_TOOL_PATH, 'fs', 'quota', 'set', '--fsname', self.fs_name,
                                           '--path', '/%s' % sharename, '--capacity', sizestr)
             self._check_dingo_result(out, 'Set quota', sharename)
         except exception.ProcessExecutionError as e:
@@ -288,7 +288,7 @@ class DingoFSShareDriver(driver.ExecuteMixin, driver.GaneshaMixin,
     def _delete_share(self, shareobj):
         sharename = shareobj['name']
         try:
-            out, __ = self._dingo_execute(self.DINGO_TOOL_PATH, 'delete', 'subpath', '--fsname', self.fs_name,
+            out, __ = self._dingo_execute(self.DINGO_TOOL_PATH, 'fs', 'subpath', 'delete', '--fsname', self.fs_name,
                                           '--path', '/%s' % sharename)
             self._check_dingo_result(out, 'Delete subpath', sharename)
         except exception.ProcessExecutionError as e:
@@ -310,7 +310,7 @@ class DingoFSShareDriver(driver.ExecuteMixin, driver.GaneshaMixin,
         # Convert size to string (unit is GB)
         sizestr = str(new_size)
         try:
-            out, __ = self._dingo_execute(self.DINGO_TOOL_PATH, 'quota', 'set', '--fsname', self.fs_name,
+            out, __ = self._dingo_execute(self.DINGO_TOOL_PATH, 'fs', 'quota', 'set', '--fsname', self.fs_name,
                                           '--path', '/%s' % sharename, '--capacity', sizestr)
             self._check_dingo_result(out, 'Extend quota', sharename)
         except exception.ProcessExecutionError as e:
@@ -391,7 +391,7 @@ class DingoFSShareDriver(driver.ExecuteMixin, driver.GaneshaMixin,
 
     def _check_dingofs_state(self):
         try:
-            out, __ = self._dingo_execute(self.DINGO_TOOL_PATH, 'status', 'mds')
+            out, __ = self._dingo_execute(self.DINGO_TOOL_PATH, 'mds', 'status')
         except exception.ProcessExecutionError as e:
             msg = (_('Failed to check DingoFS state. Error: %(excmsg)s.') %
                     {'excmsg': e})
@@ -407,7 +407,7 @@ class DingoFSShareDriver(driver.ExecuteMixin, driver.GaneshaMixin,
 
     def _is_dingofs_fs(self, fs_name):
         try:
-            out, __ = self._dingo_execute(self.DINGO_TOOL_PATH, 'query', 'fs', '--fsname', fs_name)
+            out, __ = self._dingo_execute(self.DINGO_TOOL_PATH, 'fs', 'query', '--fsname', fs_name)
         except exception.ProcessExecutionError as e:
             msg = (_('Failed to list DingoFS filesystems. Error: %(excmsg)s.') %
                     {'excmsg': e})
@@ -422,35 +422,70 @@ class DingoFSShareDriver(driver.ExecuteMixin, driver.GaneshaMixin,
                 return True
         return False
 
-    def _get_available_capacity(self, fs_name):
-        """Get available capacity of the DingoFS file system.
+    def _get_fs_used_bytes(self, fs_name):
+        """Return used bytes of the DingoFS filesystem.
 
-        Returns:
-            tuple: (free_bytes, total_bytes)
+        Uses ``dingo fs usage --format json`` whose result looks like::
+
+            {"error": {"code": 0, ...},
+             "result": [{"fsId": "10008", "fsName": "manila",
+                         "iused": "1", "used": "0"}]}
         """
         try:
             out, __ = self._dingo_execute(
-                self.DINGO_TOOL_PATH, 'config', 'get',
-                '--fsname', self.fs_name, '--format', 'json')
+                self.DINGO_TOOL_PATH, 'fs', 'usage',
+                '--fsname', fs_name, '--format', 'json')
         except exception.ProcessExecutionError as e:
-            msg = (_('Failed to get DingoFS capacity. Error: %(excmsg)s.') %
+            msg = (_('Failed to get DingoFS usage. Error: %(excmsg)s.') %
                    {'excmsg': e})
             LOG.error(msg)
             raise exception.DingoFSException(msg)
 
         try:
             data = json.loads(out)
-            quota = data['result']['quota']
-            max_bytes = int(quota['maxBytes'])
-            used_bytes = int(quota['usedBytes'])
-            free_bytes = max_bytes - used_bytes
-            return free_bytes, max_bytes
-        except (KeyError, ValueError, json.JSONDecodeError) as e:
-            msg = (_('Failed to parse DingoFS capacity response. '
+            result = data.get('result') or []
+            if result:
+                return int(result[0].get('used', 0))
+            return 0
+        except (KeyError, ValueError, TypeError,
+                json.JSONDecodeError) as e:
+            msg = (_('Failed to parse DingoFS usage response. '
                      'Error: %(excmsg)s. Response: %(response)s') %
                    {'excmsg': e, 'response': out})
             LOG.error(msg)
             raise exception.DingoFSException(msg)
+
+    def _get_available_capacity(self, fs_name):
+        """Return (free_bytes, total_bytes) for the DingoFS filesystem.
+
+        Total comes from the fs quota (``dingo fs config get`` ->
+        ``result.quota.max_bytes``); used comes from ``dingo fs usage``.
+        free = total - used.
+        """
+        try:
+            out, __ = self._dingo_execute(
+                self.DINGO_TOOL_PATH, 'fs', 'config', 'get',
+                '--fsname', fs_name, '--format', 'json')
+        except exception.ProcessExecutionError as e:
+            msg = (_('Failed to get DingoFS quota. Error: %(excmsg)s.') %
+                   {'excmsg': e})
+            LOG.error(msg)
+            raise exception.DingoFSException(msg)
+
+        try:
+            total_bytes = int(
+                json.loads(out)['result']['quota']['max_bytes'])
+        except (KeyError, ValueError, TypeError,
+                json.JSONDecodeError) as e:
+            msg = (_('Failed to parse DingoFS quota response. '
+                     'Error: %(excmsg)s. Response: %(response)s') %
+                   {'excmsg': e, 'response': out})
+            LOG.error(msg)
+            raise exception.DingoFSException(msg)
+
+        used_bytes = self._get_fs_used_bytes(fs_name)
+        free_bytes = max(total_bytes - used_bytes, 0)
+        return free_bytes, total_bytes
 
     def _update_share_stats(self):
         """Retrieve stats info from share volume group."""
@@ -471,9 +506,9 @@ class DingoFSShareDriver(driver.ExecuteMixin, driver.GaneshaMixin,
         # raise out of the periodic stats task, otherwise the whole backend
         # would flap as unavailable / un-schedulable on every cycle.
         try:
-            free, capacity = self._get_available_capacity(
+            free, total = self._get_available_capacity(
                 self.configuration.dingofs_fs_name)
-            data['total_capacity_gb'] = math.ceil(capacity / units.Gi)
+            data['total_capacity_gb'] = math.ceil(total / units.Gi)
             data['free_capacity_gb'] = math.ceil(free / units.Gi)
         except exception.DingoFSException as e:
             LOG.warning('Failed to update DingoFS capacity stats, reporting '
@@ -607,8 +642,8 @@ class VFSHelper(DingoFSNFSHelper):
                       '"dingo export remove" for share %s.', share['name'])
             return
         try:
-            out, __ = self._execute(self.DINGO_TOOL_PATH, 'export', 'remove',
-                                   '--nfs.path', share_path)
+            out, __ = self._execute(self.DINGO_TOOL_PATH, 'nfs', 'remove',
+                                   share_path)
 
         except exception.ProcessExecutionError as e:
             msg = (_('Failed to delete DingoFS share %(sharename)s. '
@@ -633,8 +668,8 @@ class VFSHelper(DingoFSNFSHelper):
         try:
             local_path = '%s/%s' % (self.fs_mount_point_base, share['name'])
             export_opts = self.get_export_options(share, access, 'VFS')
-            out, __ = self._execute(self.DINGO_TOOL_PATH, 'export', 'add',
-                                   '--nfs.path', local_path, '--nfs.conf', export_opts)
+            out, __ = self._execute(self.DINGO_TOOL_PATH, 'nfs', 'add',
+                                   local_path, '--conf', export_opts)
         except exception.ProcessExecutionError as e:
             msg = (_('Failed to add DingoFS share %(sharename)s. '
                      'Error: %(excmsg)s.') %
@@ -656,9 +691,9 @@ class VFSHelper(DingoFSNFSHelper):
             return
         #remove access
         try:
-            export_opts = self.get_export_options(share, access, 'VFS')
-            out, __ = self._execute(self.DINGO_TOOL_PATH, 'export', 'remove',
-                                   '--nfs.path', local_path, '--nfs.conf', export_opts)
+            # dingo v3.1 'nfs remove' only takes the export path.
+            out, __ = self._execute(self.DINGO_TOOL_PATH, 'nfs', 'remove',
+                                   local_path)
         except exception.ProcessExecutionError as e:
             msg = (_('Failed to remove DingoFS share %(sharename)s. '
                      'Error: %(excmsg)s.') %

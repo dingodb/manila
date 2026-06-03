@@ -2,6 +2,7 @@ import abc
 import json
 import math
 import shlex
+import socket
 
 from oslo_config import cfg
 from oslo_utils import excutils
@@ -34,6 +35,14 @@ dingofs_share_opts = [
     cfg.StrOpt('dingofs_nfs_server_type',
                default='VFS',
                help=('NFS Server type. Valid choices are "VFS" (Ganesha NFS) ')),
+    cfg.BoolOpt('dingofs_enable_export',
+                default=False,
+                help=('Whether to manage NFS exports via the "dingo export" '
+                      'commands when granting/revoking access. Requires '
+                      'Ganesha NFS to be deployed on the DingoFS node. '
+                      'Defaults to False because DingoFS does not install '
+                      'Ganesha by default; when disabled, access rules are '
+                      'accepted but no "dingo export" command is executed.')),
     cfg.BoolOpt('is_dingofs_node',
                 default=False,
                 help=('True:when Manila services are running on one of the '
@@ -57,6 +66,11 @@ dingofs_share_opts = [
                     'is configured.'),
     cfg.StrOpt('dingofs_ssh_private_key',
                help='Path to DingoFS server SSH private key for login.'),
+    cfg.IntOpt('dingofs_ssh_cmd_timeout',
+               default=120,
+               help='Timeout in seconds for a single "dingo" command '
+                    'executed over SSH. Prevents a hung command from '
+                    'blocking the manila-share worker indefinitely.'),
 ]
 
 class DingoFSShareDriver(driver.ExecuteMixin, driver.GaneshaMixin,
@@ -150,30 +164,32 @@ class DingoFSShareDriver(driver.ExecuteMixin, driver.GaneshaMixin,
             # non-interactive non-login shell by default.
             wrapped_cmd = 'bash -l -c %s' % shlex.quote(cmd)
             LOG.debug('Wrapped cmd (SSH): %s',wrapped_cmd)
-            stdin_stream, stdout_stream, stderr_stream = ssh.exec_command(wrapped_cmd)
-            channel = stdout_stream.channel
+            # A per-command timeout bounds both a hung command and the
+            # classic paramiko stdout/stderr read deadlock: read() will
+            # raise socket.timeout instead of blocking the worker forever.
+            timeout = self.configuration.dingofs_ssh_cmd_timeout
+            try:
+                stdin_stream, stdout_stream, stderr_stream = ssh.exec_command(
+                    wrapped_cmd, timeout=timeout)
+                channel = stdout_stream.channel
 
-            stdout = stdout_stream.read()
-            stderr = stderr_stream.read()
-            stdin_stream.close()
+                stdout = stdout_stream.read()
+                stderr = stderr_stream.read()
+                stdin_stream.close()
+            except socket.timeout:
+                msg = (_('DingoFS command timed out after %(timeout)ss: '
+                         '%(cmd)s') %
+                       {'timeout': timeout, 'cmd': sanitized_cmd})
+                LOG.error(msg)
+                raise exception.DingoFSException(msg)
 
             def _to_text(val):
-                # Normalize bytes/str/stringified-bytes and escaped newlines
+                # Normalize bytes/str output to text. Do not unescape "\n"
+                # here: that would corrupt legitimate backslash sequences in
+                # command output (e.g. JSON from "config get").
                 if isinstance(val, bytes):
-                    val = val.decode('utf-8', 'ignore')
-                else:
-                    val = str(val)
-                    if val.startswith("b'") or val.startswith('b"'):
-                        try:
-                            import ast
-                            val_eval = ast.literal_eval(val)
-                            if isinstance(val_eval, bytes):
-                                val = val_eval.decode('utf-8', 'ignore')
-                            else:
-                                val = str(val_eval)
-                        except Exception:
-                            val = val[2:-1]
-                return val.replace('\\n', '\n')
+                    return val.decode('utf-8', 'ignore')
+                return str(val)
 
             stdout = _to_text(stdout)
             stderr = _to_text(stderr)
@@ -182,29 +198,50 @@ class DingoFSShareDriver(driver.ExecuteMixin, driver.GaneshaMixin,
             sanitized_stderr = strutils.mask_password(stderr)
 
             exit_status = channel.recv_exit_status()
+            LOG.debug('Result was %s', exit_status)
 
-            # exit_status == -1 if no exit code was returned
-            if exit_status != -1:
-                LOG.debug('Result was %s', exit_status)
-                if ((check_exit_code and exit_status != 0)
-                        and
-                        (ignore_exit_code is None or
-                         exit_status not in ignore_exit_code)):
-                    raise exception.ProcessExecutionError(exit_code=exit_status,
-                                                          stdout=sanitized_stdout,
-                                                          stderr=sanitized_stderr,
-                                                          cmd=sanitized_cmd)
+            # exit_status == -1 means the channel closed without returning an
+            # exit code; treat it as a failure rather than silently succeeding.
+            check_failed = (
+                exit_status == -1
+                or (exit_status != 0
+                    and (ignore_exit_code is None
+                         or exit_status not in ignore_exit_code)))
+            if check_exit_code and check_failed:
+                raise exception.ProcessExecutionError(
+                    exit_code=exit_status,
+                    stdout=sanitized_stdout,
+                    stderr=sanitized_stderr,
+                    cmd=sanitized_cmd)
 
             return (sanitized_stdout, sanitized_stderr)
 
     def _check_dingo_result(self, out, operation, sharename):
-        """Check if dingo command output contains success."""
-        if 'success' not in out.lower():
-            msg = (_('%(operation)s for DingoFS share %(sharename)s '
-                     'did not return success. Output: %(out)s') %
-                   {'operation': operation, 'sharename': sharename, 'out': out})
-            LOG.error(msg)
-            raise exception.DingoFSException(msg)
+        """Best-effort sanity check on a dingo command's stdout.
+
+        Success/failure is determined by the command exit code (a non-zero
+        exit raises ProcessExecutionError in the executor). The output is
+        only inspected as a secondary diagnostic: a missing "success" token
+        is logged as a warning but does NOT fail the operation, since the
+        dingo CLI may succeed silently or print to stderr.
+        """
+        if out is None or 'success' not in out.lower():
+            LOG.warning('%(operation)s for DingoFS share %(sharename)s '
+                        'exited successfully but output did not contain '
+                        '"success". Output: %(out)s',
+                        {'operation': operation, 'sharename': sharename,
+                         'out': out})
+
+    @staticmethod
+    def _error_output_contains(e, keywords):
+        """Return True if a ProcessExecutionError's output mentions a keyword.
+
+        Used to make create/delete idempotent by recognising "already
+        exists" / "not found" style messages from the dingo CLI.
+        """
+        text = ('%s %s' % (getattr(e, 'stdout', '') or '',
+                           getattr(e, 'stderr', '') or '')).lower()
+        return any(kw in text for kw in keywords)
 
     def _create_share(self, shareobj):
         sharename = shareobj['name']
@@ -215,18 +252,33 @@ class DingoFSShareDriver(driver.ExecuteMixin, driver.GaneshaMixin,
                                           '--path', '/%s' % sharename)
             self._check_dingo_result(out, 'Create subpath', sharename)
         except exception.ProcessExecutionError as e:
-            msg = (_('Failed to create DingoFS share %(sharename)s. '
-                     'Error: %(excmsg)s.') %
-                   {'sharename': sharename,
-                    'excmsg': e})
-            LOG.error(msg)
-            raise exception.DingoFSException(msg)
+            # Idempotency: an already-existing subpath is not an error, the
+            # operation may be a retry of a previously interrupted create.
+            if self._error_output_contains(e, ('already exist', 'exists')):
+                LOG.info('DingoFS subpath for share %s already exists, '
+                         'treating create as idempotent.', sharename)
+            else:
+                msg = (_('Failed to create DingoFS share %(sharename)s. '
+                         'Error: %(excmsg)s.') %
+                       {'sharename': sharename,
+                        'excmsg': e})
+                LOG.error(msg)
+                raise exception.DingoFSException(msg)
 
         try:
             out, __ = self._dingo_execute(self.DINGO_TOOL_PATH, 'quota', 'set', '--fsname', self.fs_name,
                                           '--path', '/%s' % sharename, '--capacity', sizestr)
             self._check_dingo_result(out, 'Set quota', sharename)
         except exception.ProcessExecutionError as e:
+            # Roll back the subpath we just created so we don't leave an
+            # orphaned directory that would break a later retry.
+            LOG.error('Failed to set quota for DingoFS share %s, rolling '
+                      'back the created subpath.', sharename)
+            try:
+                self._delete_share(shareobj)
+            except Exception:
+                LOG.exception('Rollback of subpath for share %s failed; '
+                              'manual cleanup may be required.', sharename)
             msg = (_('Failed to set quota for DingoFS share %(sharename)s. '
                      'Error: %(excmsg)s.') %
                    {'sharename': sharename,
@@ -240,6 +292,12 @@ class DingoFSShareDriver(driver.ExecuteMixin, driver.GaneshaMixin,
                                           '--path', '/%s' % sharename)
             self._check_dingo_result(out, 'Delete subpath', sharename)
         except exception.ProcessExecutionError as e:
+            # Idempotency: a missing subpath means it is already deleted.
+            if self._error_output_contains(
+                    e, ('not found', 'not exist', 'no such', 'does not exist')):
+                LOG.info('DingoFS subpath for share %s not found, treating '
+                         'delete as idempotent.', sharename)
+                return
             msg = (_('Failed to delete DingoFS share %(sharename)s. '
                      'Error: %(excmsg)s.') %
                    {'sharename': sharename,
@@ -409,11 +467,19 @@ class DingoFSShareDriver(driver.ExecuteMixin, driver.GaneshaMixin,
                 self.configuration.reserved_share_extend_percentage
                 or self.configuration.reserved_share_percentage))
 
-        free, capacity = self._get_available_capacity(
-            self.configuration.dingofs_fs_name)
-
-        data['total_capacity_gb'] = math.ceil(capacity / units.Gi)
-        data['free_capacity_gb'] = math.ceil(free / units.Gi)
+        # Degrade gracefully: a transient failure to read capacity must not
+        # raise out of the periodic stats task, otherwise the whole backend
+        # would flap as unavailable / un-schedulable on every cycle.
+        try:
+            free, capacity = self._get_available_capacity(
+                self.configuration.dingofs_fs_name)
+            data['total_capacity_gb'] = math.ceil(capacity / units.Gi)
+            data['free_capacity_gb'] = math.ceil(free / units.Gi)
+        except exception.DingoFSException as e:
+            LOG.warning('Failed to update DingoFS capacity stats, reporting '
+                        'unknown capacity this cycle. Error: %s', e)
+            data['total_capacity_gb'] = 'unknown'
+            data['free_capacity_gb'] = 'unknown'
 
         super(DingoFSShareDriver, self)._update_share_stats(data)
 
@@ -536,6 +602,10 @@ class VFSHelper(DingoFSNFSHelper):
 
     def remove_export(self, share_path, share):
         """Remove export for the given share path."""
+        if not self.configuration.dingofs_enable_export:
+            LOG.debug('dingofs_enable_export is disabled, skipping '
+                      '"dingo export remove" for share %s.', share['name'])
+            return
         try:
             out, __ = self._execute(self.DINGO_TOOL_PATH, 'export', 'remove',
                                    '--nfs.path', share_path)
@@ -554,6 +624,10 @@ class VFSHelper(DingoFSNFSHelper):
         if access['access_type'] != 'ip':
             raise exception.InvalidShareAccess(reason='Only ip access type '
                                                       'supported.')
+        if not self.configuration.dingofs_enable_export:
+            LOG.debug('dingofs_enable_export is disabled, skipping '
+                      '"dingo export add" for share %s.', share['name'])
+            return
         #check has export?
         #add access
         try:
@@ -576,6 +650,10 @@ class VFSHelper(DingoFSNFSHelper):
         if access['access_type'] != 'ip':
             raise exception.InvalidShareAccess(reason='Only ip access type '
                                                       'supported.')
+        if not self.configuration.dingofs_enable_export:
+            LOG.debug('dingofs_enable_export is disabled, skipping '
+                      '"dingo export remove" for share %s.', share['name'])
+            return
         #remove access
         try:
             export_opts = self.get_export_options(share, access, 'VFS')
